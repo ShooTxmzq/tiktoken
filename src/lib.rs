@@ -2,122 +2,93 @@
 #![allow(clippy::borrow_deref_ref)]
 
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::thread;
 
 use fancy_regex::Regex;
 use pyo3::exceptions;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use pyo3::PyResult;
 use rustc_hash::FxHashMap as HashMap;
 
-fn _byte_pair_merge<T>(
-    piece: &[u8],
-    ranks: &HashMap<Vec<u8>, usize>,
-    f: impl Fn(std::ops::Range<usize>) -> T,
-) -> Vec<T> {
+type Rank = u32;
+
+fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
     // This is a vector of (start, rank).
-    // The rank is of the byte pair starting at position start.
-    // The rank of the last item in the vector is not a valid value.
-    let mut parts: Vec<(usize, usize)> = (0..piece.len() + 1).map(|i| (i, usize::MAX)).collect();
+    // The rank is of the pair starting at position start.
+    let mut parts = Vec::with_capacity(piece.len() + 1);
 
-    // NOTE: using a macro here because a closure fails to get inlined
-    // according to optimization remarks.
-    // A closure also cannot capture a reference to `piece` without
-    // the borrow checker complaining about the mutable borrows during
-    // the assignments later in this code.
-    macro_rules! get_rank {
-        ($start_idx:expr, $skip:expr) => {{
-            let start_idx: usize = $start_idx;
-            let skip: usize = $skip;
-            if (start_idx + skip + 2) < parts.len() {
-                ranks
-                    .get(&piece[parts[start_idx].0..parts[start_idx + skip + 2].0])
-                    .map(|r| *r)
+    // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
+    // the way we currently do, this is equivalent. An easy way to break this would be to decouple
+    // merge priority from token index or to prevent specific token merges.
+    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
+    for i in 0..piece.len() - 1 {
+        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        if rank < min_rank.0 {
+            min_rank = (rank, i);
+        }
+        parts.push((i, rank));
+    }
+    parts.push((piece.len() - 1, Rank::MAX));
+    parts.push((piece.len(), Rank::MAX));
+
+    let get_rank = {
+        #[inline(always)]
+        |parts: &Vec<(usize, Rank)>, i: usize| {
+            if (i + 3) < parts.len() {
+                // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
+                // parts[i + 1], see comment in the main loop.
+                *ranks
+                    .get(&piece[parts[i].0..parts[i + 3].0])
+                    .unwrap_or(&Rank::MAX)
             } else {
-                None
+                Rank::MAX
             }
-        }};
-        ($idx:expr) => {{
-            get_rank!($idx, 0)
-        }};
-    }
-
-    // We look up the ranks once in the beggining and iteratively update
-    // them during each merge, which reduces the number of rank lookups.
-    for i in 0..parts.len() - 2 {
-        match get_rank!(i) {
-            Some(rank) => {
-                // usize::MAX is a sentinel value and cannot be a valid rank
-                debug_assert!(rank != usize::MAX);
-                parts[i].1 = rank;
-            }
-            None => {
-                continue;
-            }
-        };
-    }
+        }
+    };
 
     // If you have n parts and m merges, this does O(mn) work.
     // We could do something with a heap and do O(m log n) work.
-    // It is important to consider that n is often small (<100), and as such
-    // the cache-locality benefits outweigh the algorithmic complexity downsides
-    // of the `parts` vector data structure above.
-
-    // Note that we hash bytes, not token pairs. As long as we train BPE the way we
-    // currently do, this is equivalent. An easy way to break this would be to decouple
-    // merge priority from token index or to prevent specific token merges.
-    loop {
-        if parts.len() == 1 {
-            break;
+    // n is often very small so considerations like cache-locality outweigh the algorithmic
+    // complexity downsides of the `parts` vector.
+    while min_rank.0 != Rank::MAX {
+        let i = min_rank.1;
+        // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
+        // `parts.remove(i + 1)` will thrash the cache.
+        if i > 0 {
+            parts[i - 1].1 = get_rank(&parts, i - 1);
         }
+        parts[i].1 = get_rank(&parts, i);
+        parts.remove(i + 1);
 
-        // usize::MAX is a sentinel rank value allowing us to
-        // take the min more quickly
-        let mut min_rank: (usize, usize) = (usize::MAX, 0);
+        min_rank = (Rank::MAX, usize::MAX);
         for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
             if rank < min_rank.0 {
                 min_rank = (rank, i);
             }
         }
-
-        if min_rank.0 != usize::MAX {
-            let i = min_rank.1;
-
-            // NOTE: We are about to remove parts[i + 1]. We do not do it
-            // yet because there are cache-locality benefits to updating
-            // parts[i] and parts[i-1] before removing, which could thrash
-            // the cache. Thus, we update the rank calculation by skipping over
-            // parts[i + 1], by invoking `get_rank!` with `skip = 1`.
-            parts[i].1 = get_rank!(i, 1).unwrap_or(usize::MAX);
-            if i > 0 {
-                parts[i - 1].1 = get_rank!(i - 1, 1).unwrap_or(usize::MAX);
-            }
-
-            parts.remove(i + 1);
-        } else {
-            break;
-        }
     }
-    let mut out: Vec<T> = Vec::with_capacity(parts.len() - 1);
-    for i in 0..parts.len() - 1 {
-        out.push(f(parts[i].0..parts[i + 1].0));
-    }
-    out
+    parts
 }
 
-pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, usize>) -> Vec<usize> {
+pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     if piece.len() == 1 {
         return vec![ranks[piece]];
     }
-    _byte_pair_merge(piece, ranks, |p| ranks[&piece[p.start..p.end]])
+    _byte_pair_merge(ranks, piece)
+        .windows(2)
+        .map(|part| ranks[&piece[part[0].0..part[1].0]])
+        .collect()
 }
 
-pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, usize>) -> Vec<&'a [u8]> {
-    if piece.len() == 1 {
-        return vec![piece];
-    }
-    _byte_pair_merge(piece, ranks, |p| &piece[p.start..p.end])
+pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
+    assert!(piece.len() > 1);
+    _byte_pair_merge(ranks, piece)
+        .windows(2)
+        .map(|part| &piece[part[0].0..part[1].0])
+        .collect()
 }
 
 // Various performance notes:
@@ -161,7 +132,6 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, usize>) -> 
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
-use std::num::NonZeroU64;
 pub struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -177,13 +147,25 @@ fn hash_current_thread() -> usize {
     u64::from(x) as usize
 }
 
+#[derive(Debug, Clone)]
+struct DecodeKeyError {
+    token: Rank,
+}
+
+impl std::fmt::Display for DecodeKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Invalid token for decoding: {}", self.token)
+    }
+}
+
 const MAX_NUM_THREADS: usize = 128;
+
 #[pyclass]
 struct CoreBPE {
-    encoder: HashMap<Vec<u8>, usize>,
-    special_tokens_encoder: HashMap<String, usize>,
-    decoder: HashMap<usize, Vec<u8>>,
-    special_tokens_decoder: HashMap<usize, Vec<u8>>,
+    encoder: HashMap<Vec<u8>, Rank>,
+    special_tokens_encoder: HashMap<String, Rank>,
+    decoder: HashMap<Rank, Vec<u8>>,
+    special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -201,35 +183,37 @@ impl CoreBPE {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
     }
 
-    fn _decode_native(&self, tokens: &[usize]) -> Vec<u8> {
+    fn _decode_native(&self, tokens: &[Rank]) -> Result<Vec<u8>, DecodeKeyError> {
         let mut ret = Vec::with_capacity(tokens.len() * 2);
-        for token in tokens {
-            let token_bytes = self
-                .decoder
-                .get(token)
-                .unwrap_or_else(|| &self.special_tokens_decoder[token]);
+        for &token in tokens {
+            let token_bytes = match self.decoder.get(&token) {
+                Some(bytes) => bytes,
+                None => self
+                    .special_tokens_decoder
+                    .get(&token)
+                    .ok_or(DecodeKeyError { token })?,
+            };
             ret.extend(token_bytes);
         }
-        ret
+        Ok(ret)
     }
 
-    fn _encode_ordinary_native(&self, text: &str) -> Vec<usize> {
+    fn _encode_ordinary_native(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
-            if let Some(token) = self.encoder.get(piece) {
-                ret.push(*token);
-                continue;
+            match self.encoder.get(piece) {
+                Some(token) => ret.push(*token),
+                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
             }
-            ret.extend(&byte_pair_encode(piece, &self.encoder));
         }
         ret
     }
 
-    fn _encode_native(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<usize>, usize) {
+    fn _encode_native(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<Rank>, usize) {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
@@ -287,9 +271,9 @@ impl CoreBPE {
 
     fn _increase_last_piece_token_len(
         &self,
-        tokens: Vec<usize>,
+        tokens: Vec<Rank>,
         mut last_piece_token_len: usize,
-    ) -> (Vec<usize>, usize) {
+    ) -> (Vec<Rank>, usize) {
         // Unfortunately, the locations where our regex splits can be unstable.
         // For the purposes of determining unstable tokens, unstable regex splitting
         // is only a problem if a split that was present disappears, since this can
@@ -328,7 +312,7 @@ impl CoreBPE {
         &self,
         text: &str,
         allowed_special: &HashSet<&str>,
-    ) -> (Vec<usize>, HashSet<Vec<usize>>) {
+    ) -> (Vec<Rank>, HashSet<Vec<Rank>>) {
         let (tokens, last_piece_token_len) = self._encode_native(text, allowed_special);
         if last_piece_token_len == 0 {
             // If last_piece_token_len is zero, the last token was a special token and we have
@@ -338,7 +322,9 @@ impl CoreBPE {
         let (mut tokens, last_piece_token_len) =
             self._increase_last_piece_token_len(tokens, last_piece_token_len);
 
-        let unstable_bytes = self._decode_native(&tokens[tokens.len() - last_piece_token_len..]);
+        let unstable_bytes = self
+            ._decode_native(&tokens[tokens.len() - last_piece_token_len..])
+            .unwrap();
         tokens.truncate(tokens.len() - last_piece_token_len);
 
         // TODO: we should try harder to find additional stable tokens
@@ -445,8 +431,8 @@ impl CoreBPE {
 impl CoreBPE {
     #[new]
     fn new(
-        encoder: HashMap<Vec<u8>, usize>,
-        special_tokens_encoder: HashMap<String, usize>,
+        encoder: HashMap<Vec<u8>, Rank>,
+        special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> PyResult<Self> {
         let regex = Regex::new(pattern)
@@ -461,12 +447,15 @@ impl CoreBPE {
                 .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?
         };
 
-        let decoder: HashMap<usize, Vec<u8>> =
+        let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
 
-        assert!(encoder.len() == decoder.len());
+        assert!(
+            encoder.len() == decoder.len(),
+            "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?"
+        );
 
-        let special_tokens_decoder: HashMap<usize, Vec<u8>> = special_tokens_encoder
+        let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
             .iter()
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
@@ -492,15 +481,34 @@ impl CoreBPE {
     // Encoding
     // ====================
 
-    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<usize> {
+    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<Rank> {
         py.allow_threads(|| self._encode_ordinary_native(text))
     }
 
-    fn encode(&self, py: Python, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
-        py.allow_threads(|| self._encode_native(text, &allowed_special).0)
+    fn encode(&self, py: Python, text: &str, allowed_special: HashSet<PyBackedStr>) -> Vec<Rank> {
+        py.allow_threads(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self._encode_native(text, &allowed_special).0
+        })
     }
 
-    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<usize> {
+    fn encode_to_tiktoken_buffer(
+        &self,
+        py: Python,
+        text: &str,
+        allowed_special: HashSet<PyBackedStr>,
+    ) -> Py<PyAny> {
+        let tokens = py.allow_threads(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self._encode_native(text, &allowed_special).0
+        });
+        let buffer = TiktokenBuffer { tokens };
+        buffer.into_py(py)
+    }
+
+    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
         py.allow_threads(|| {
             match std::str::from_utf8(bytes) {
                 Ok(text) => self._encode_ordinary_native(text),
@@ -514,12 +522,18 @@ impl CoreBPE {
                         // Somewhat niche, but this may not be correct if we'd have had a regex
                         // split between the valid UTF-8 and the invalid bytes, which is why this
                         // method is private
-                        let mut unstable_bytes =
-                            self._decode_native(&tokens[tokens.len() - last_piece_token_len..]);
+                        let mut unstable_bytes = self
+                            ._decode_native(&tokens[tokens.len() - last_piece_token_len..])
+                            .unwrap();
                         unstable_bytes.extend_from_slice(&bytes[e.valid_up_to()..]);
 
                         tokens.truncate(tokens.len() - last_piece_token_len);
-                        tokens.extend(byte_pair_encode(&unstable_bytes, &self.encoder));
+                        match self.encoder.get(&unstable_bytes) {
+                            Some(token) => tokens.push(*token),
+                            None => {
+                                tokens.extend(&byte_pair_encode(&unstable_bytes, &self.encoder))
+                            }
+                        }
                     }
                     tokens
                 }
@@ -531,16 +545,23 @@ impl CoreBPE {
         &self,
         py: Python,
         text: &str,
-        allowed_special: HashSet<&str>,
+        allowed_special: HashSet<PyBackedStr>,
     ) -> Py<PyTuple> {
-        let (tokens, completions) =
-            py.allow_threads(|| self._encode_unstable_native(text, &allowed_special));
-        let py_completions =
-            PyList::new(py, completions.iter().map(|seq| PyList::new(py, &seq[..])));
+        let (tokens, completions) = py.allow_threads(|| {
+            let allowed_special: HashSet<&str> =
+                allowed_special.iter().map(|s| s.as_ref()).collect();
+            self._encode_unstable_native(text, &allowed_special)
+        });
+        let py_completions = PyList::new_bound(
+            py,
+            completions
+                .iter()
+                .map(|seq| PyList::new_bound(py, &seq[..])),
+        );
         (tokens, py_completions).into_py(py)
     }
 
-    fn encode_single_token(&self, piece: &[u8]) -> PyResult<usize> {
+    fn encode_single_token(&self, piece: &[u8]) -> PyResult<Rank> {
         if let Some(token) = self.encoder.get(piece).copied() {
             return Ok(token);
         }
@@ -552,7 +573,7 @@ impl CoreBPE {
         Err(PyErr::new::<exceptions::PyKeyError, _>(piece.to_owned()))
     }
 
-    fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
+    fn encode_single_piece(&self, piece: &[u8]) -> Vec<Rank> {
         if let Some(token) = self.encoder.get(piece) {
             return vec![*token];
         }
@@ -563,17 +584,19 @@ impl CoreBPE {
     // Decoding
     // ====================
 
-    fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
-        let bytes = py.allow_threads(|| self._decode_native(&tokens));
-        PyBytes::new(py, &bytes).into()
+    fn decode_bytes(&self, py: Python, tokens: Vec<Rank>) -> Result<Py<PyBytes>, PyErr> {
+        match py.allow_threads(|| self._decode_native(&tokens)) {
+            Ok(bytes) => Ok(PyBytes::new_bound(py, &bytes).into()),
+            Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
+        }
     }
 
-    fn decode_single_token_bytes(&self, py: Python, token: usize) -> PyResult<Py<PyBytes>> {
+    fn decode_single_token_bytes(&self, py: Python, token: Rank) -> PyResult<Py<PyBytes>> {
         if let Some(bytes) = self.decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
+            return Ok(PyBytes::new_bound(py, bytes).into());
         }
         if let Some(bytes) = self.special_tokens_decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
+            return Ok(PyBytes::new_bound(py, bytes).into());
         }
         Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))
     }
@@ -585,30 +608,96 @@ impl CoreBPE {
     fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
         self.sorted_token_bytes
             .iter()
-            .map(|x| PyBytes::new(py, x).into())
+            .map(|x| PyBytes::new_bound(py, x).into())
             .collect()
     }
 }
 
+#[pyclass]
+struct TiktokenBuffer {
+    tokens: Vec<Rank>,
+}
+
+#[pymethods]
+impl TiktokenBuffer {
+    // Based on https://github.com/PyO3/pyo3/blob/v0.22.2/tests/test_buffer_protocol.rs#L25
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("View is null"));
+        }
+        if (flags & pyo3::ffi::PyBUF_WRITABLE) == pyo3::ffi::PyBUF_WRITABLE {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "Object is not writable",
+            ));
+        }
+
+        (*view).obj = slf.clone().into_any().into_ptr();
+
+        let data = &slf.borrow().tokens;
+        (*view).buf = data.as_ptr() as *mut std::os::raw::c_void;
+        (*view).len = (data.len() * std::mem::size_of::<Rank>()) as isize;
+        (*view).readonly = 1;
+        (*view).itemsize = std::mem::size_of::<Rank>() as isize;
+        (*view).format = if (flags & pyo3::ffi::PyBUF_FORMAT) == pyo3::ffi::PyBUF_FORMAT {
+            let msg = std::ffi::CString::new("I").unwrap();
+            msg.into_raw()
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).ndim = 1;
+        (*view).shape = if (flags & pyo3::ffi::PyBUF_ND) == pyo3::ffi::PyBUF_ND {
+            &mut (*view).len
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).strides = if (flags & pyo3::ffi::PyBUF_STRIDES) == pyo3::ffi::PyBUF_STRIDES {
+            &mut (*view).itemsize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = std::ptr::null_mut();
+
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, view: *mut pyo3::ffi::Py_buffer) {
+        std::mem::drop(std::ffi::CString::from_raw((*view).format));
+    }
+}
+
 #[pymodule]
-fn _tiktoken(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::byte_pair_split;
+    use crate::{byte_pair_split, Rank};
+
+    fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
+        HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
+    }
 
     #[test]
-    fn very_simple_test() {
-        let mut ranks = HashMap::default();
-        ranks.insert(b"ab".to_vec(), 1);
-        ranks.insert(b"cd".to_vec(), 2);
-
+    fn test_simple_characters() {
+        let ranks = setup_ranks();
         let res = byte_pair_split(b"abcd", &ranks);
         assert_eq!(res, vec![b"ab", b"cd"]);
+    }
+
+    #[test]
+    fn test_repeated_characters() {
+        let ranks = setup_ranks();
+        let res = byte_pair_split(b"abab", &ranks);
+        assert_eq!(res, vec![b"ab", b"ab"]);
     }
 }
