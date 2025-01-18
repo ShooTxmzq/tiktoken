@@ -1,0 +1,11 @@
+{
+    "mssql.connections": [
+        {
+            "server": "your_server_name",
+            "database": "your_database_name",
+            "user": "your_username",
+            "password": "your_password",
+            "authenticationType": "SqlLogin"
+        }
+    ]
+}
